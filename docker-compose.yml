@@ -1,0 +1,24 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.105.0   # pinned version
+    env_file: .env                            # loads ANTHROPIC_API_KEY and LITELLM_MASTER_KEY
+    volumes:
+      - ./gateway:/app/gateway:ro             # config, hooks, tenants.yaml (read-only)
+    environment:
+      PYTHONPATH: /app/gateway                # lets the hooks import tenants.py and pii.py
+    command: ["--config", "/app/gateway/config.yaml", "--port", "4000"]
+    ports:
+      - "4000:4000"                           # host:container
+
+  # Run with: docker compose run --rm tests
+  tests:
+    profiles: ["test"]                        # not started by a plain "docker compose up"
+    build:
+      context: ./tests                        # only tests/ is sent to the build, never .env
+    volumes:
+      - ./gateway:/app/gateway:ro
+      - ./tests:/app/tests:ro
+    environment:
+      PYTHONPATH: /app/gateway                # so "import tenant_hook" works
+      PYTHONDONTWRITEBYTECODE: "1"            # mounts are read-only; don't try to write .pyc
+    entrypoint: ["python", "-m", "pytest", "/app/tests", "-v", "-p", "no:cacheprovider"]

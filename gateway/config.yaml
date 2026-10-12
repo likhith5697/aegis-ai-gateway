@@ -1,0 +1,19 @@
+model_list:
+  - model_name: claude-opus-5-5            # the name clients ask for
+    litellm_params:
+      model: anthropic/claude-opus-5-5     # provider/model LiteLLM actually calls
+      api_key: os.environ/ANTHROPIC_API_KEY  # read from the environment, not stored here
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  # <file>.<object>, loaded from this config's folder. Hooks run in list order:
+  # tenant check first, so rejected requests never reach the PII scrubber.
+  callbacks:
+    - tenant_hook.proxy_handler_instance
+    - pii_hook.proxy_handler_instance
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY  # clients must send this to use the proxy

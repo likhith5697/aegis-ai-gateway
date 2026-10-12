@@ -1,0 +1,2 @@
+# Real secrets live here. Never commit it.
+.env
