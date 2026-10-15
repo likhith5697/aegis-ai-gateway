@@ -1,0 +1,62 @@
+# Sandbox gateway for the load test and the failover demo. Same hooks and tenants
+# as config.yaml, but both models are the chaos server (scripts/chaos_llm.py).
+# It never calls Anthropic and holds no real key.
+model_list:
+  - model_name: claude-opus-5-5          # the primary in the demo: breakable on demand
+    litellm_params:
+      model: openai/chaos-primary
+      api_base: http://chaos:8080/v1
+      api_key: not-a-real-key
+      # LiteLLM has no price for a fake model, so cost would be unknown. Use the real
+      # Claude Opus 5.5 prices from LiteLLM's price list ($4 / $20 per million tokens).
+      input_cost_per_token: 0.000004
+      output_cost_per_token: 0.00002
+    model_info:
+      allowed_fails_policy: &circuit_breaker  # same as config.yaml (a test checks)
+        RateLimitErrorAllowedFails: 0
+        TimeoutErrorAllowedFails: 1
+        InternalServerErrorAllowedFails: 2
+        ServiceUnavailableErrorAllowedFails: 2
+        BadGatewayErrorAllowedFails: 2
+        AuthenticationErrorAllowedFails: 1000000
+        NotFoundErrorAllowedFails: 1000000
+        BadRequestErrorAllowedFails: 1000000
+        ContentPolicyViolationErrorAllowedFails: 1000000
+  - model_name: claude-sonnet-5-5        # its fallback: always healthy
+    litellm_params:
+      model: openai/chaos-backup
+      api_base: http://chaos:8080/v1
+      api_key: not-a-real-key
+      input_cost_per_token: 0.000002   # Claude Sonnet 5.5 prices ($2 / $10 per million tokens)
+      output_cost_per_token: 0.00001
+    model_info:
+      allowed_fails_policy: *circuit_breaker
+
+# Same failover policy as config.yaml (a test checks), except shorter waits for demos.
+router_settings:
+  fallbacks:
+    - claude-opus-5-5: [claude-sonnet-5-5]
+    - claude-sonnet-5-5: [claude-opus-5-5]
+  timeout: 3                    # config.yaml: 120
+  num_retries: 1
+  retry_policy:
+    RateLimitErrorRetries: 0
+    TimeoutErrorRetries: 0
+    InternalServerErrorRetries: 1
+    ServiceUnavailableErrorRetries: 1
+    AuthenticationErrorRetries: 0
+    BadRequestErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+    NotFoundErrorRetries: 0
+  cooldown_time: 15             # config.yaml: 30
+
+litellm_settings:
+  callbacks:
+    - tenant_hook.proxy_handler_instance
+    - pii_hook.proxy_handler_instance
+    - budget_hook.proxy_handler_instance
+    - failover_hook.proxy_handler_instance
+    - telemetry_hook.proxy_handler_instance
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

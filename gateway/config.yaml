@@ -3,17 +3,57 @@ model_list:
     litellm_params:
       model: anthropic/claude-opus-5-5     # provider/model LiteLLM actually calls
       api_key: os.environ/ANTHROPIC_API_KEY  # read from the environment, not stored here
+    model_info:
+      # Circuit breaker: failures of each type per minute before this model is skipped for
+      # cooldown_time. Set per model so every error type gets its own counter; at router
+      # level all types share one, and a few 401s would trip the breaker on the next 503.
+      allowed_fails_policy: &circuit_breaker
+        RateLimitErrorAllowedFails: 0       # 1st 429 → cooldown (the provider asked us to back off)
+        TimeoutErrorAllowedFails: 1         # 2nd timeout in a minute → cooldown
+        InternalServerErrorAllowedFails: 2  # 3rd 5xx in a minute → cooldown
+        ServiceUnavailableErrorAllowedFails: 2
+        BadGatewayErrorAllowedFails: 2
+        AuthenticationErrorAllowedFails: 1000000  # never: a bad key or request says nothing
+        NotFoundErrorAllowedFails: 1000000        # about the model's health
+        BadRequestErrorAllowedFails: 1000000
+        ContentPolicyViolationErrorAllowedFails: 1000000
   - model_name: claude-sonnet-5-5
     litellm_params:
       model: anthropic/claude-sonnet-5-5
       api_key: os.environ/ANTHROPIC_API_KEY
+    model_info:
+      allowed_fails_policy: *circuit_breaker  # same policy as above (YAML anchor)
+
+# Failover, done by LiteLLM's router. Keep in sync with config.sandbox.yaml (a test checks).
+# Which errors may fail over at all is decided in failover.py (429/5xx/timeouts yes, other 4xx no).
+router_settings:
+  fallbacks:                    # one hop; a tenant only gets fallbacks in its allowed_models
+    - claude-opus-5-5: [claude-sonnet-5-5]
+    - claude-sonnet-5-5: [claude-opus-5-5]
+  timeout: 120                  # seconds per attempt; long Opus answers need room
+  num_retries: 1                # retries on the same model, for error types not listed below
+  retry_policy:                 # retries on the same model before failing over
+    RateLimitErrorRetries: 0          # throttled: go to the fallback instead of waiting
+    TimeoutErrorRetries: 0            # a retry would double an already long wait
+    InternalServerErrorRetries: 1     # 5xx blips often pass on a second try
+    ServiceUnavailableErrorRetries: 1
+    AuthenticationErrorRetries: 0     # retrying can't fix a bad key or a bad request
+    BadRequestErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+    NotFoundErrorRetries: 0
+  cooldown_time: 30             # seconds a tripped model is skipped (a 429's Retry-After wins)
 
 litellm_settings:
   # <file>.<object>, loaded from this config's folder. Hooks run in list order:
-  # tenant check first, so rejected requests never reach the PII scrubber.
+  # tenant check → PII scrub → token budget → failover → telemetry. The budget goes
+  # after the checks because it reserves tokens: a later hook that rejected would
+  # leave a reservation behind. Failover and telemetry never reject, they only record.
   callbacks:
     - tenant_hook.proxy_handler_instance
     - pii_hook.proxy_handler_instance
+    - budget_hook.proxy_handler_instance
+    - failover_hook.proxy_handler_instance
+    - telemetry_hook.proxy_handler_instance
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY  # clients must send this to use the proxy

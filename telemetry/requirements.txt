@@ -1,0 +1,2 @@
+redis==5.3.1            # same version as the gateway (inside the LiteLLM image)
+influxdb-client==1.50.0 # official client for InfluxDB 2.x

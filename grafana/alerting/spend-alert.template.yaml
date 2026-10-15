@@ -1,0 +1,71 @@
+# Alerting as code: where notifications go, and one rule.
+# TEMPLATE: render_alerting.py replaces __AEGIS_SPEND_ALERT_USD__ with the number from .env
+# and writes the real file Grafana loads (it does not fill in env variables in alert rules itself).
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: console-log
+    receivers:
+      - uid: aegis-console-log
+        type: webhook                 # Grafana has no "print to console" notifier, so a tiny
+        settings:                     # container (scripts/alert_logger.py) prints what it receives
+          url: http://alert-logger:8080/
+          httpMethod: POST
+
+policies:
+  - orgId: 1
+    receiver: console-log             # every alert goes to the console logger
+    group_by: ["alertname", "tenant"] # one notification per tenant
+    group_wait: 10s                   # short, so the demo shows it quickly
+    group_interval: 1m
+    repeat_interval: 1h
+
+groups:
+  - orgId: 1
+    name: aegis-finops
+    folder: Aegis
+    interval: 1m                      # evaluate every minute
+    rules:
+      - uid: aegis-tenant-spend-1h
+        title: Tenant spend in the last hour over threshold
+        condition: C
+        data:
+          - refId: A                  # each tenant's spend over the last hour
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: aegis-influxdb
+            model:
+              refId: A
+              query: |
+                from(bucket: "usage")
+                  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+                  |> filter(fn: (r) => r._measurement == "llm_usage" and r._field == "cost_usd")
+                  |> group(columns: ["tenant"])
+                  |> sum()
+                  |> duplicate(column: "_stop", as: "_time")
+          - refId: B                  # one number per tenant
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C                  # firing when that number is over the threshold from .env
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [__AEGIS_SPEND_ALERT_USD__]
+        for: 0s                       # fire on the first evaluation over the threshold
+        noDataState: OK               # no traffic is not a problem
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant }} spent {{ printf "%.4f" $values.B.Value }} USD in the last hour,
+            over the __AEGIS_SPEND_ALERT_USD__ USD threshold.

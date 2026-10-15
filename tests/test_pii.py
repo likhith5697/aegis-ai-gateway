@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from pii import PIIDetector, PIIMatch, RegexDetector, luhn_valid, redact
 from pii_hook import DISABLED, RESULT_KEY, PIIHook
+from settings import FAIL_OPEN
 
 
 def scrub(text):
@@ -235,16 +236,26 @@ def test_litellm_logging_copy_is_scrubbed_too(hook):
     assert data["proxy_server_request"]["body"]["messages"][0]["content"] == "SSN [REDACTED_SSN]"
 
 
-def test_broken_detector_fails_closed(tenants_file, pii_logs):
-    class BrokenDetector(PIIDetector):
-        async def detect(self, text):
-            raise RuntimeError(f"could not scan: {text}")
+class BrokenDetector(PIIDetector):
+    async def detect(self, text):
+        raise RuntimeError(f"could not scan: {text}")
 
+
+def test_broken_detector_fails_closed_by_default(tenants_file, pii_logs):
     hook = PIIHook(detector=BrokenDetector(), tenants_file=tenants_file)
     with pytest.raises(HTTPException) as exc:
         run_hook(hook, make_request([{"role": "user", "content": "SSN 123-45-6789"}]))
     assert exc.value.status_code == 503
-    assert pii_logs == ["pii_scrub_failed tenant=support error=RuntimeError"]  # no text in the log
+    assert pii_logs == ["pii_scrub_failed tenant=support error=RuntimeError action=reject"]  # no text in the log
+
+
+def test_broken_detector_can_be_set_to_fail_open(tenants_file, pii_logs):
+    hook = PIIHook(detector=BrokenDetector(), tenants_file=tenants_file, on_detector_error=FAIL_OPEN)
+    data = make_request([{"role": "user", "content": "SSN 123-45-6789"}])
+    run_hook(hook, data)  # not rejected
+    assert data["messages"][0]["content"] == "SSN 123-45-6789"  # sent as-is: that's the risk of fail-open
+    assert pii_logs == ["pii_scrub_failed tenant=support error=RuntimeError action=allow_unscrubbed"]
+    assert response_headers(hook, data) == {"x-aegis-pii-redactions": "unavailable"}
 
 
 def test_any_detector_plugs_in_without_changing_the_hook(tenants_file):

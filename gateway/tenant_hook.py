@@ -6,18 +6,28 @@ Tenant-ID header, look the tenant up in tenants.yaml, and reject the request if
 the tenant is missing, unknown, or asking for a model it may not use.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
+from failover import configured_fallbacks
 from tenants import DEFAULT_TENANTS_FILE, get_tenant_id, load_tenants
+
+# Fallback settings a client could send to steer failover; LiteLLM honors them if present.
+CLIENT_FALLBACK_KEYS = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks")
 
 
 class TenantHook(CustomLogger):
-    def __init__(self, tenants_file: Path = DEFAULT_TENANTS_FILE):
+    def __init__(
+        self,
+        tenants_file: Path = DEFAULT_TENANTS_FILE,
+        fallbacks_for: Callable[[str], list[str]] = configured_fallbacks,
+    ):
         super().__init__()
         self.tenants = load_tenants(tenants_file)
+        self.fallbacks_for = fallbacks_for
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         tenant_id = get_tenant_id(data)
@@ -41,6 +51,13 @@ class TenantHook(CustomLogger):
                 status_code=403,
                 detail={"error": f"Tenant '{tenant_id}' is not allowed to use model '{model}'"},
             )
+
+        # Fallbacks: only configured ones this tenant may also use. Always overwrite what the
+        # client sent; otherwise a client could name its own fallback and dodge allowed_models.
+        for key in CLIENT_FALLBACK_KEYS:
+            data.pop(key, None)
+        allowed_fallbacks = [m for m in self.fallbacks_for(model) if m in tenant["allowed_models"]]
+        data["fallbacks"] = [{model: allowed_fallbacks}] if allowed_fallbacks else []
 
         return data
 

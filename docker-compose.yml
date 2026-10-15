@@ -5,10 +5,123 @@ services:
     volumes:
       - ./gateway:/app/gateway:ro             # config, hooks, tenants.yaml (read-only)
     environment:
-      PYTHONPATH: /app/gateway                # lets the hooks import tenants.py and pii.py
+      PYTHONPATH: /app/gateway                # lets the hooks import their sibling modules
+      AEGIS_REDIS_URL: redis://redis:6379/0   # "redis" = the service below, on the compose network
+      AEGIS_RATELIMIT_FAIL_MODE: ${AEGIS_RATELIMIT_FAIL_MODE:-open}  # Redis down: open = allow + warn
+      AEGIS_PII_FAIL_MODE: ${AEGIS_PII_FAIL_MODE:-closed}            # detector down: closed = reject
+      AEGIS_TELEMETRY_REDIS_URL: redis://redis:6379/0  # usage events go to the aegis:usage stream
+      AEGIS_GATEWAY_NAME: main                # tag on every usage event
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"    # use the price list bundled in the pinned image
     command: ["--config", "/app/gateway/config.yaml", "--port", "4000"]
     ports:
       - "4000:4000"                           # host:container
+    depends_on:
+      redis:
+        condition: service_healthy            # start only once Redis answers PING
+
+  redis:
+    image: redis:8.10.2-alpine                # pinned version
+    # Budgets only matter for 60 seconds, so skip saving to disk.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # No "ports:" on purpose: only containers on this compose network can reach Redis.
+
+  # --- Usage telemetry: gateway → Redis Stream → consumer → InfluxDB ---
+
+  influxdb:
+    image: influxdb:2.7.12-alpine             # 2.7.x, the line Amazon Timestream for InfluxDB runs
+    environment:
+      # First start only (empty volume): create the org, bucket and admin token automatically.
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD:?set INFLUXDB_ADMIN_PASSWORD in .env}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      DOCKER_INFLUXDB_INIT_ORG: aegis
+      DOCKER_INFLUXDB_INIT_BUCKET: usage
+      DOCKER_INFLUXDB_INIT_RETENTION: 30d     # older usage data is deleted automatically
+    volumes:
+      - influxdb-data:/var/lib/influxdb2      # keeps the data across restarts
+      - influxdb-config:/etc/influxdb2
+    ports:
+      - "127.0.0.1:8086:8086"                 # web UI on your machine only, not your network
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  telemetry-consumer:
+    build:
+      context: ./telemetry
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      INFLUX_ORG: aegis
+      INFLUX_BUCKET: usage
+      CONSUMER_NAME: writer-1                 # stable: after a restart it re-reads its own pending events
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Dashboard and alerting: Grafana reads InfluxDB ---
+
+  grafana:
+    image: grafana/grafana:13.2.3             # pinned version
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?set GRAFANA_ADMIN_USER in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"      # everyone must log in
+      GF_USERS_ALLOW_SIGN_UP: "false"         # no self-made accounts
+      # Read by the datasource provisioning file ($INFLUXDB_ADMIN_TOKEN is replaced with it):
+      INFLUXDB_ADMIN_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro  # datasource, dashboard provider, plugins
+      - grafana-alerting:/etc/grafana/provisioning/alerting:ro  # rendered by grafana-alerting (below)
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro      # the dashboard JSON
+      - grafana-data:/var/lib/grafana                        # users, alert state
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"  # UI on your machine only; set GRAFANA_PORT if 3000 is taken
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      grafana-alerting:
+        condition: service_completed_successfully  # alert rules rendered first
+      alert-logger:
+        condition: service_started
+
+  # Runs once per "up": fills the spend threshold from .env into the alert rule file.
+  grafana-alerting:
+    image: python:3.13.16-slim                # stdlib only
+    volumes:
+      - ./grafana:/app/grafana:ro
+      - grafana-alerting:/out
+    environment:
+      AEGIS_SPEND_ALERT_USD: ${AEGIS_SPEND_ALERT_USD:-0.05}
+    command: ["python", "/app/grafana/render_alerting.py"]
+
+  alert-logger:
+    image: python:3.13.16-slim                # stdlib only, nothing to install
+    volumes:
+      - ./scripts:/app/scripts:ro
+    command: ["python", "-u", "/app/scripts/alert_logger.py"]
+
+  # Tools, run on demand (profile "tools"). For dashboard screenshots see docker-compose.screenshot.yml.
+  # Regenerate grafana/dashboards/aegis-gateway.json:  docker compose run --rm build-dashboard
+  build-dashboard:
+    profiles: ["tools"]
+    image: ghcr.io/berriai/litellm:v1.105.0   # reused for its Python + PyYAML
+    volumes:
+      - ./grafana:/app/grafana                # writable: the script writes the JSON here
+      - ./gateway:/app/gateway:ro             # reads tenants.yaml
+    entrypoint: ["python", "/app/grafana/build_dashboard.py"]
 
   # Run with: docker compose run --rm tests
   tests:
@@ -17,8 +130,105 @@ services:
       context: ./tests                        # only tests/ is sent to the build, never .env
     volumes:
       - ./gateway:/app/gateway:ro
+      - ./telemetry:/app/telemetry:ro
+      - ./grafana:/app/grafana:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro  # some tests check settings in it
       - ./tests:/app/tests:ro
     environment:
-      PYTHONPATH: /app/gateway                # so "import tenant_hook" works
+      PYTHONPATH: /app/gateway:/app/telemetry:/app/grafana  # import tenant_hook, consumer, build_dashboard
       PYTHONDONTWRITEBYTECODE: "1"            # mounts are read-only; don't try to write .pyc
+      AEGIS_TEST_REDIS_URL: redis://redis:6379/15  # DB 15: never touches the gateway's DB 0
+      AEGIS_TEST_CHAOS_URL: http://chaos:8080
+      INFLUX_URL: http://influxdb:8086        # tests create and delete their own bucket
+      INFLUX_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      INFLUX_ORG: aegis
+    depends_on:
+      redis:
+        condition: service_healthy
+      chaos:
+        condition: service_started
+      influxdb:
+        condition: service_healthy
     entrypoint: ["python", "-m", "pytest", "/app/tests", "-v", "-p", "no:cacheprovider"]
+
+  # --- Sandbox: a second gateway with the same hooks, wired to fake models ---
+  # It has no Anthropic key, so the load test and failover demo can never spend money.
+
+  chaos:
+    profiles: ["test"]
+    image: ghcr.io/berriai/litellm:v1.105.0   # reused only for its Python
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      CHAOS_MODE: ${CHAOS_MODE:-ok}           # start mode; switch at runtime with failover-demo --set
+    entrypoint: ["python", "/app/scripts/chaos_llm.py"]
+
+  litellm-sandbox:
+    profiles: ["test"]
+    image: ghcr.io/berriai/litellm:v1.105.0
+    volumes:
+      - ./gateway:/app/gateway:ro
+    environment:
+      PYTHONPATH: /app/gateway
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}  # only the master key, never the Anthropic key
+      AEGIS_REDIS_URL: redis://redis:6379/1      # DB 1: separate budgets from the real gateway
+      AEGIS_TELEMETRY_REDIS_URL: redis://redis:6379/0  # same usage stream; events tagged gateway=sandbox
+      AEGIS_GATEWAY_NAME: sandbox
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    command: ["--config", "/app/gateway/config.sandbox.yaml", "--port", "4000"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      chaos:
+        condition: service_started
+
+  # Run with: docker compose run --rm loadtest
+  loadtest:
+    profiles: ["test"]
+    build:
+      context: ./tests                        # same image as the tests: has httpx
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      GATEWAY_URL: http://litellm-sandbox:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    depends_on:
+      - litellm-sandbox
+    entrypoint: ["python", "/app/scripts/load_test.py"]
+
+  # Run with: docker compose run --rm failover-demo [--auto | --set 503]
+  failover-demo:
+    profiles: ["test"]
+    build:
+      context: ./tests
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      GATEWAY_URL: http://litellm-sandbox:4000
+      CHAOS_URL: http://chaos:8080
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    depends_on:
+      - litellm-sandbox
+    entrypoint: ["python", "/app/scripts/failover_demo.py"]
+
+  # Run with: docker compose run --rm traffic   (realistic usage data for the dashboard)
+  traffic:
+    profiles: ["test"]
+    build:
+      context: ./tests
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      GATEWAY_URL: http://litellm-sandbox:4000
+      CHAOS_URL: http://chaos:8080
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    depends_on:
+      - litellm-sandbox
+      - telemetry-consumer
+    entrypoint: ["python", "/app/scripts/traffic.py"]
+
+volumes:
+  influxdb-data:
+  influxdb-config:
+  grafana-data:
+  grafana-alerting:

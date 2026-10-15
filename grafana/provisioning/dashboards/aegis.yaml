@@ -1,0 +1,12 @@
+# Loads every dashboard JSON in /etc/grafana/dashboards (mounted from grafana/dashboards/).
+apiVersion: 1
+
+providers:
+  - name: aegis
+    folder: Aegis
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false             # the JSON file is the source of truth; UI edits can't be saved over it
+    updateIntervalSeconds: 30         # picks up a regenerated JSON without restarting Grafana
+    options:
+      path: /etc/grafana/dashboards

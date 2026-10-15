@@ -1,0 +1,4 @@
+# No plugins to provision. This file exists because Grafana expects the folder
+# (our mount replaces its default provisioning folders).
+apiVersion: 1
+apps: []

@@ -1,0 +1,17 @@
+# Loaded by Grafana at startup. The fixed uid lets the dashboard and alert rule refer to it.
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB (usage)
+    uid: aegis-influxdb
+    type: influxdb
+    access: proxy                     # Grafana's server calls InfluxDB; the browser never sees the token
+    url: http://influxdb:8086
+    isDefault: true
+    editable: false                   # change it here, not in the UI
+    jsonData:
+      version: Flux
+      organization: aegis
+      defaultBucket: usage
+    secureJsonData:
+      token: $INFLUXDB_ADMIN_TOKEN    # from the container's environment, never written in this file

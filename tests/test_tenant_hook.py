@@ -20,11 +20,14 @@ tenants:
 """
 
 
+CONFIGURED_FALLBACKS = {"big-model": ["cheap-model"], "cheap-model": ["big-model"]}
+
+
 @pytest.fixture
 def hook(tmp_path):
     tenants_file = tmp_path / "tenants.yaml"
     tenants_file.write_text(TEST_TENANTS)
-    return TenantHook(tenants_file)
+    return TenantHook(tenants_file, fallbacks_for=lambda model: CONFIGURED_FALLBACKS.get(model, []))
 
 
 def make_request(headers, model="cheap-model"):
@@ -93,6 +96,30 @@ def test_disallowed_model_is_403(hook):
         run_hook(hook, make_request({"tenant-id": "support"}, model="big-model"))
     assert exc.value.status_code == 403
     assert "not allowed to use model 'big-model'" in exc.value.detail["error"]
+
+
+# --- fallbacks: only to models the tenant may use ---
+
+def test_fallback_allowed_for_tenant_is_kept(hook):
+    data = make_request({"tenant-id": "engineering"}, model="big-model")
+    run_hook(hook, data)
+    assert data["fallbacks"] == [{"big-model": ["cheap-model"]}]
+
+
+def test_fallback_the_tenant_may_not_use_is_dropped(hook):
+    # support may only use cheap-model, so its configured fallback (big-model) is off-limits.
+    data = make_request({"tenant-id": "support"}, model="cheap-model")
+    run_hook(hook, data)
+    assert data["fallbacks"] == []
+
+
+def test_client_cannot_choose_its_own_fallbacks(hook):
+    data = make_request({"tenant-id": "support"}, model="cheap-model")
+    data["fallbacks"] = ["big-model"]                        # would dodge allowed_models
+    data["content_policy_fallbacks"] = [{"cheap-model": ["big-model"]}]
+    run_hook(hook, data)
+    assert data["fallbacks"] == []
+    assert "content_policy_fallbacks" not in data
 
 
 # --- loading tenants.yaml ---

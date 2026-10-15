@@ -1,0 +1,16 @@
+# Screenshot add-on: Grafana's official image renderer. Only needed to update docs/dashboard.png.
+# Layer it on top of the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.screenshot.yml up -d grafana grafana-renderer
+# Grafana refuses to start with the renderer's default token, so both sides share one from .env.
+services:
+  grafana:
+    environment:
+      GF_RENDERING_SERVER_URL: http://grafana-renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+      GF_RENDERING_RENDERER_TOKEN: ${GRAFANA_RENDERER_TOKEN:?set GRAFANA_RENDERER_TOKEN in .env}
+
+  grafana-renderer:
+    image: grafana/grafana-image-renderer:v5.12.4   # pinned version
+    environment:
+      AUTH_TOKEN: ${GRAFANA_RENDERER_TOKEN:?set GRAFANA_RENDERER_TOKEN in .env}
+    # No ports: only Grafana talks to it.

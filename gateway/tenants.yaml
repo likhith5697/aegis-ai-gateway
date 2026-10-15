@@ -1,6 +1,6 @@
 # Who may use the gateway. The Tenant-ID header must match one of these names.
 #   allowed_models: model names (from config.yaml) this tenant may request
-#   tpm_quota:      tokens per minute; not enforced yet (later task)
+#   tpm_quota:      tokens per minute, enforced over a sliding 60-second window (Redis)
 #   pii_scrubbing:  optional, default true. Set to false to send prompts unredacted.
 tenants:
   support:
