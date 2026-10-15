@@ -123,6 +123,12 @@ Failover is done by **LiteLLM's router**, configured under `router_settings` in 
 
 ## Usage telemetry
 
+### In plain language
+
+When a request finishes, `telemetry_hook.py` writes down a short summary: which tenant made the request, which model was asked for and which one answered, how many tokens were used, the estimated cost, how long it took, and whether it succeeded. It does not save what the user wrote or what the model replied.
+
+`telemetry.py` puts that summary into a queue so the gateway can return the answer without waiting for the database. A separate service saves the queued summaries in InfluxDB, and Grafana turns them into charts and spend alerts. This helps you monitor and compare estimated costs by tenant and model; it is not an exact invoice, and a cost may be unavailable when LiteLLM has no price for a model.
+
 Every request, successful or rejected, produces exactly one usage event:
 
 ```
@@ -158,6 +164,8 @@ The event is built field by field from this list. Nothing is copied from the req
 Unknown tenants and models are stored as `unknown` / `other` rather than whatever the client sent, so a client can't create unlimited tag values (see below).
 
 ### Cost
+
+In simple terms, this helps you see which tenant and model are using tokens and what those requests are estimated to cost. Use it to monitor and compare spend, not as an exact invoice: the estimate depends on LiteLLM's configured model prices, and is unavailable for models without a known price.
 
 The cost comes from LiteLLM (`response_cost`), not from prices written into our code. LiteLLM ships a price list (`model_prices_and_context_window.json`) with input and output prices per token for each known model, and multiplies those by the token counts.
 
